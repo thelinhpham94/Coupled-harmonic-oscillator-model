@@ -1,0 +1,128 @@
+%% Coupled Oscillators Analysis with w1-w2 Scan and Combined Plots
+clear; close all; clc;
+
+%% Gap sizes
+gList = [0.02,0.04,0.06,0.08,0.10,0.12,0.14,0.16,0.18,0.20,0.22,0.24,0.26];
+nG    = numel(gList);
+
+% Preallocate
+gamma1 = NaN(1,nG); gamma2 = NaN(1,nG); vval = NaN(1,nG);
+fitted_spec = cell(1,nG); freq_all = cell(1,nG); spec_all = cell(1,nG);
+
+%% Initial guess [a1, g1, g2, v, scale, baseline]
+initial_params = [135.5, 5.8, 0.77, 34.4, 1, 0];
+
+%% Scan ranges for w1 and w2
+w1_range = 28:0.2:29;
+w2_range = 26.5:0.2:27.5;
+
+dataFolder = 'P:/Matlab/Fano fitting/Simulations/New folder (2)';
+
+for k = 1:nG
+    g = gList(k);
+    fname = sprintf('g=%.2f.csv', g);
+    filename = fullfile(dataFolder, fname);
+    if ~exist(filename, 'file')
+        error('Cannot find file "%s".', filename);
+    end
+
+    data = importdata(filename);
+    freq = 300000./data(:,1); % Hz
+    spec = data(:,2);
+
+    % Limit to 25–35 THz
+    mask = (freq >= 25) & (freq <= 35);
+    freq = freq(mask);
+    spec = spec(mask);
+
+    %% Scan w1 and w2
+    results = [];
+    for w1_val = w1_range
+        for w2_val = w2_range
+            syms x_1(t) x_2(t) g_1 g_2 v a_1 omega x_1_0 x_2_0
+            x_1 = x_1_0 * exp(1i*omega*t);
+            x_2 = x_2_0 * exp(1i*omega*t);
+            eq1 = diff(x_1,t,2)+w1_val^2*x_1+g_1*diff(x_1,t)-v^2*x_2==a_1*exp(1i*omega*t);
+            eq2 = diff(x_2,t,2)+w2_val^2*x_2+g_2*diff(x_2,t)-v^2*x_1==0;
+            sol = solve([eq1,eq2],[x_1_0,x_2_0]);
+            x1_0_local = matlabFunction(sol.x_1_0,'Vars',[a_1,g_1,g_2,omega,v]);
+
+            model = @(p,w) p(5)*abs(x1_0_local(p(1),p(2),p(3),w,p(4))) + p(6);
+            errfun = @(p) sum((model(p,freq)-spec).^2);
+
+            opts = optimset('MaxFunEvals',1e4,'MaxIter',1e4,'Display','off');
+            best_p = fminsearch(errfun, initial_params, opts);
+
+            results = [results; w1_val, w2_val, errfun(best_p)];
+        end
+    end
+
+    [~, idx] = min(results(:,3));
+    best_w1 = results(idx,1);
+    best_w2 = results(idx,2);
+    fprintf('Gap %.2f: Best w1=%.2f, w2=%.2f\n', g, best_w1, best_w2);
+
+    %% Final fit with best w1, w2
+    syms x_1(t) x_2(t) g_1 g_2 v a_1 omega x_1_0 x_2_0
+    x_1 = x_1_0 * exp(1i*omega*t);
+    x_2 = x_2_0 * exp(1i*omega*t);
+    eq1 = diff(x_1,t,2)+best_w1^2*x_1+g_1*diff(x_1,t)-v^2*x_2==a_1*exp(1i*omega*t);
+    eq2 = diff(x_2,t,2)+best_w2^2*x_2+g_2*diff(x_2,t)-v^2*x_1==0;
+    sol = solve([eq1,eq2],[x_1_0,x_2_0]);
+    x1_0_local = matlabFunction(sol.x_1_0,'Vars',[a_1,g_1,g_2,omega,v]);
+
+    model = @(p,w) p(5)*abs(x1_0_local(p(1),p(2),p(3),w,p(4))) + p(6);
+    errfun = @(p) sum((model(p,freq)-spec).^2);
+    best_p = fminsearch(errfun, initial_params, opts);
+
+    gamma1(k) = best_p(2);
+    gamma2(k) = best_p(3);
+    vval(k)   = best_p(4);
+
+    fitted_spec{k} = model(best_p,freq);
+    freq_all{k} = freq; spec_all{k} = spec;
+
+    initial_params = best_p; % warm start
+end
+
+%% Correlation analysis
+corr_gap_v = corr(gList', vval', 'Type', 'Pearson');
+corr_gap_g1 = corr(gList', gamma1', 'Type', 'Pearson');
+corr_gap_g2 = corr(gList', gamma2', 'Type', 'Pearson');
+
+fprintf('\nCorrelation Summary:\n');
+fprintf('gap vs v: %.3f\n', corr_gap_v);
+fprintf('gap vs gamma1: %.3f\n', corr_gap_g1);
+fprintf('gap vs gamma2: %.3f\n', corr_gap_g2);
+
+%% Combined plot: damping and coupling vs gap
+figure('Name','Damping & Coupling vs Gap','NumberTitle','off');
+yyaxis left;
+plot(gList,gamma1,'-o','LineWidth',1.5,'DisplayName','\gamma_1'); hold on;
+plot(gList,gamma2,'-s','LineWidth',1.5,'DisplayName','\gamma_2');
+ylabel('Damping rates (\gamma)');
+yyaxis right;
+plot(gList,vval,'-d','LineWidth',1.5,'DisplayName','v');
+ylabel('Coupling strength v');
+xlabel('Gap size g'); grid on;
+title('Damping Rates and Coupling Strength vs Gap');
+legend('Location','best');
+
+%% Plot correlation 3D
+figure('Name','Correlation Plot','NumberTitle','off');
+scatter3(gamma1,gamma2,vval,60,gList,'filled');
+xlabel('\gamma_1'); ylabel('\gamma_2'); zlabel('v');
+title('Correlation between \gamma_1, \gamma_2, and v'); colorbar; grid on;
+text(mean(gamma1),mean(gamma2),max(vval),sprintf('corr(g,v)=%.2f',corr_gap_v),'FontSize',10);
+
+%% Plot spectra grid
+figure('Name','Spectra Grid','NumberTitle','off');
+rows = ceil(nG/4); cols = 4;
+for k = 1:nG
+    subplot(rows,cols,k);
+    plot(freq_all{k}/1e12,spec_all{k},'k.'); hold on;
+    plot(freq_all{k}/1e12,fitted_spec{k},'r-','LineWidth',1.2);
+    title(sprintf('g=%.2f',gList(k)));
+    xlabel('f (THz)'); ylabel('T'); grid on;
+end
+sgtitle('Measured vs Fitted Spectra (25–35 THz)');
