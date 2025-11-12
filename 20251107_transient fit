@@ -1,0 +1,136 @@
+%% fit_time_list_sweep_w2.m
+% Sweeps w2 for each time in tList, fits spectrum, saves and plots results
+
+clear; close all; clc;
+
+%% 1) Settings
+g = 0.08;
+tList = [-11, 0.6, 1, 3, 5, 7, 10, 20, 50, 100];
+w1 = 28.3;
+w2_range = 26.5:0.1:28;
+init = [25.68, 1.67, 0.36, 44.3];
+
+results = [];
+
+%% 2) Output and data folders
+basePath = 'P:\Report and results\Manuscripts\FELIX_0124\FEL scan';
+outF = fullfile(basePath, 'results');
+dataF = fullfile(basePath, 'Smoothed');
+if ~exist(outF, 'dir'), mkdir(outF); end
+
+%% 3) Loop over time delays
+for t = tList
+    fname = sprintf('g=%.2f_%gps.txt', g, t);
+    filePath = fullfile(dataF, fname);
+    
+    if ~isfile(filePath)
+        warning('File not found for t = %.1f ps', t);
+        continue;
+    end
+
+    D = importdata(filePath);
+    freq = 300 ./ D(:,1);
+    spec = 1 - D(:,2);
+
+    best_score = Inf;
+    best_w2 = NaN;
+    best_out = [];
+
+    %% 4) Sweep w2 to find best fit
+    for w2 = w2_range
+        try
+            out = fitSpectrumWithFixedW(freq, spec, init, w1, w2);
+            score = sum(out.stds(2:3)); % uncertainty in γ1 and γ2
+            if score < best_score
+                best_score = score;
+                best_w2 = w2;
+                best_out = out;
+            end
+        catch
+            continue;
+        end
+    end
+
+    %% 5) Store results
+    if isempty(best_out)
+        warning('No valid fit for t = %.1f ps', t);
+        continue;
+    end
+
+    p = best_out.params;
+    s = best_out.stds;
+    results(end+1,:) = [t, p(2), s(2), p(3), s(3), p(4), s(4), w1, best_w2];
+
+    %% 6) Plot fit
+    modelSpec = best_out.model(freq, p);
+    figure;
+    plot(freq, spec, 'b-', 'DisplayName', 'Original');
+    hold on;
+    plot(freq, modelSpec, 'r--', 'DisplayName', 'Fit');
+    xlabel('Frequency'); ylabel('Absorption');
+    title(sprintf('Fit (t = %.1f ps, w2 = %.2f)', t, best_w2));
+    legend; grid on;
+    exportgraphics(gcf, fullfile(outF, sprintf('fit_g=%.2f_t=%.1fps_w2=%.2f.png', g, t, best_w2)));
+    close;
+end
+
+%% 7) Save all results
+T = array2table(results, 'VariableNames', ...
+    {'t', 'gamma1', 'err_gamma1', 'gamma2', 'err_gamma2', 'v', 'err_v', 'w1', 'w2'});
+writetable(T, fullfile(outF, 'fit_results_vs_time.csv'));
+
+%% 8) Plot γ₁, γ₂, and v vs time
+figure;
+errorbar(T.t, T.gamma1, T.err_gamma1, 'o-', 'DisplayName', '\gamma_1');
+hold on;
+errorbar(T.t, T.gamma2, T.err_gamma2, 's-', 'DisplayName', '\gamma_2');
+xlabel('Time (ps)'); ylabel('\gamma'); legend; grid on;
+title('\gamma_1 and \gamma_2 vs Time');
+exportgraphics(gcf, fullfile(outF, 'gamma_vs_time.png'));
+
+figure;
+errorbar(T.t, T.v, T.err_v, 'd-', 'DisplayName', 'v');
+xlabel('Time (ps)'); ylabel('Coupling v'); legend; grid on;
+title('Coupling v vs Time');
+exportgraphics(gcf, fullfile(outF, 'v_vs_time.png'));
+
+%% Helper: fit with fixed w1, w2
+function out = fitSpectrumWithFixedW(freq, spec, init, w1, w2)
+    persistent solFun w1_prev w2_prev
+    if isempty(solFun) || w1 ~= w1_prev || w2 ~= w2_prev
+        syms t x1(t) x2(t) g1 g2 v a1 omega x10 x20
+        x1 = x10 * exp(1i * omega * t);
+        x2 = x20 * exp(1i * omega * t);
+        eq1 = diff(x1, t, 2) + w1^2 * x1 + g1 * diff(x1, t) - v * x2 == a1 * exp(1i * omega * t);
+        eq2 = diff(x2, t, 2) + w2^2 * x2 + g2 * diff(x2, t) - v * x1 == 0;
+        sol = solve([eq1, eq2], [x10, x20]);
+        solFun = matlabFunction(sol.x10, 'Vars', [a1, g1, g2, omega, v]);
+        w1_prev = w1; w2_prev = w2;
+    end
+
+    model = @(p, w) abs(solFun(p(1), p(2), p(3), w, p(4)));
+    resid = @(p) model(p, freq) - spec;
+
+    try
+        opts = optimoptions('lsqnonlin', 'Display', 'off');
+        pFit = lsqnonlin(resid, init, zeros(1,4), [], opts);
+    catch ME
+        warning('lsqnonlin failed: %s. Falling back to fminsearch.', ME.message);
+        pFit = fminsearch(@(p) sum(resid(p).^2), init);
+    end
+
+    r = resid(pFit); n = numel(r); m = numel(pFit);
+    sigma = sqrt(sum(r.^2) / max(n - m, 1));
+    dp = max(abs(pFit), 1e-3) * 1e-6 + 1e-8;
+    J = zeros(n, m);
+    for j = 1:m
+        d = zeros(1, m); d(j) = dp(j);
+        J(:, j) = (resid(pFit + d) - resid(pFit - d)) / (2 * dp(j));
+    end
+    C = sigma^2 * pinv(J' * J + 1e-6 * trace(J' * J) / m * eye(m));
+    out.params = pFit;
+    out.stds   = sqrt(diag(C));
+    out.model  = @(w, p) abs(solFun(p(1), p(2), p(3), w, p(4)));
+end
+
+end  % <-- Required to close the script when using local functions
