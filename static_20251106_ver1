@@ -1,0 +1,137 @@
+%% multi_gap_fit_with_errorbars_and_export.m
+% Fits a driven coupled‐oscillator model to spectra for different gap sizes g,
+% extracts damping rates γ₁, γ₂ and coupling strength v with 1σ error bars,
+% plots them vs gap size, and exports the figures and plot data to CSV files.
+
+clear; close all; clc;
+
+%% 1) List of gap sizes (must match your filenames g=0.08.csv, etc.)
+gList = [0.02,0.04,0.06,0.08,0.10,0.12,0.14,0.16,0.18,0.20,0.22,0.24,0.26];
+nG    = numel(gList);
+
+% Preallocate storage
+gamma1     = NaN(1,nG);
+gamma2     = NaN(1,nG);
+vval       = NaN(1,nG);
+
+gamma1_err = NaN(1,nG);
+gamma2_err = NaN(1,nG);
+v_err      = NaN(1,nG);
+
+%% 2) Initial guess for [a1, g1, g2, v]
+initial_params = [135.5, 5.8, 0.77, 34.4];
+
+%% 3) Loop over gap sizes and perform fitting
+dataFolder = 'P:/Matlab/Fano fitting/Simulations/New folder (2)';  % adjust to your actual folder
+for k = 1:nG
+    g = gList(k);
+    fname    = sprintf('g=%.2f.csv', g);
+    filename = fullfile(dataFolder, fname);
+    if ~exist(filename, 'file')
+        error('Cannot find file "%s".', filename);
+    end
+
+    % Import the spectrum data
+data = importdata(filename);
+freq = 300000./data(:,1);
+spec = data(:,2);
+
+    % Fit this spectrum and obtain parameters + uncertainties
+[best_p, paramStd] = fitOscillatorSpectrum(freq, spec, initial_params);
+
+    % Store results
+gamma1(k)     = best_p(2)/2;
+gamma1_err(k) = paramStd(2);
+gamma2(k)     = best_p(3);
+gamma2_err(k) = paramStd(3);
+vval(k)       = best_p(4);
+v_err(k)      = paramStd(4);
+
+    % Update initial guess for next iteration
+initial_params = best_p;
+end
+
+%% 4) Create output directories
+figFolder     = fullfile(dataFolder, 'figures');
+dataFolderOut = fullfile(dataFolder, 'output_data');
+if ~exist(figFolder, 'dir'),     mkdir(figFolder);     end
+if ~exist(dataFolderOut, 'dir'), mkdir(dataFolderOut); end
+
+%% 5) Export plot data to CSV files
+% Damping data (γ₁, γ₂ vs gap size)
+T_damp = table(gList', gamma1', gamma1_err', gamma2', gamma2_err', ...
+    'VariableNames', {'Gap','Gamma1','Gamma1_err','Gamma2','Gamma2_err'});
+writetable(T_damp, fullfile(dataFolderOut, 'damping_vs_gap.csv'));
+
+% Coupling data (v vs gap size)
+T_coup = table(gList', vval', v_err', 'VariableNames', {'Gap','Coupling','Coupling_err'});
+writetable(T_coup, fullfile(dataFolderOut, 'coupling_vs_gap.csv'));
+
+%% 6) Plot and export figures
+% Damping vs gap size
+h1 = figure('Name','Damping vs Gap Size','NumberTitle','off');
+errorbar(gList, gamma1, gamma1_err, '-o','LineWidth',1.2,'DisplayName','\gamma_1'); hold on;
+errorbar(gList, gamma2, gamma2_err, '-s','LineWidth',1.2,'DisplayName','\gamma_2');
+xlabel('Gap size g'); ylabel('Damping rate \gamma');
+title('Extracted Damping Rates vs Gap Size');
+legend('Location','best'); grid on;
+saveas(h1, fullfile(figFolder,'damping_vs_gap.png'));
+saveas(h1, fullfile(figFolder,'damping_vs_gap.pdf'));
+
+% Coupling vs gap size
+h2 = figure('Name','Coupling vs Gap Size','NumberTitle','off');
+errorbar(gList, vval, v_err, '-d','LineWidth',1.2,'DisplayName','v');
+xlabel('Gap size g'); ylabel('Coupling strength v');
+title('Extracted Coupling Strength vs Gap Size');
+grid on;
+saveas(h2, fullfile(figFolder,'coupling_vs_gap.png'));
+saveas(h2, fullfile(figFolder,'coupling_vs_gap.pdf'));
+
+%% ------------------------------------------------------------------------
+function [best_params, paramStd] = fitOscillatorSpectrum(frequency, spectrum, initial_params)
+    % Fits a driven coupled-oscillator model to a single spectrum
+    % and returns best-fit parameters + 1σ uncertainties.
+
+    persistent x1_0_sol;
+    if isempty(x1_0_sol)
+        % Build symbolic solution once
+        syms x_1(t) x_2(t) w_1 w_2 g_1 g_2 v a_1 omega x_1_0 x_2_0
+        assume([w_1 w_2 g_1 g_2 v a_1 omega],'real');
+        assume([w_1 w_2 g_1 g_2 v a_1 omega],'positive');
+        w_1 = 29.5;  w_2 = 26.9;
+        x_1 = x_1_0 * exp(1i*omega*t);
+        x_2 = x_2_0 * exp(1i*omega*t);
+        eq1 = diff(x_1,t,2) + w_1^2*x_1 + g_1*diff(x_1,t) - v^2*x_2 == a_1*exp(1i*omega*t);
+        eq2 = diff(x_2,t,2) + w_2^2*x_2 + g_2*diff(x_2,t) - v^2*x_1 == 0;
+        sol = solve([eq1,eq2],[x_1_0,x_2_0]);
+        x1_0_sol = matlabFunction(sol.x_1_0, 'Vars', [a_1,g_1,g_2,omega,v]);
+    end
+
+    % Model function
+    model = @(p,w) abs(x1_0_sol(p(1), p(2), p(3), w, p(4)));
+
+    % Objective: sum of squared residuals
+    errfun = @(p) sum((model(p,frequency) - spectrum).^2);
+
+    % Fit using fminsearch
+    opts = optimset('MaxFunEvals',1e4, 'MaxIter',1e4, 'Display','off');
+    best_params = fminsearch(errfun, initial_params, opts);
+
+    % Compute residuals and covariance-based uncertainties
+    yfit      = model(best_params, frequency);
+    res       = spectrum - yfit;
+    n         = numel(frequency);
+    pcount    = numel(best_params);
+    sigma_tot = sqrt(sum(res.^2)/(n - pcount));
+    dp = abs(best_params)*1e-6 + 1e-8;
+    J  = zeros(n, pcount);
+    for j = 1:pcount
+        d           = zeros(1, pcount);
+        d(j)        = dp(j);
+        y_plus      = model(best_params + d, frequency);
+        y_minus     = model(best_params - d, frequency);
+        J(:,j)      = (y_plus - y_minus) / (2*dp(j));
+    end
+    Cov      = sigma_tot^2 * inv(J' * J);
+    paramStd = sqrt(diag(Cov));
+end
