@@ -132,5 +132,3 @@ function out = fitSpectrumWithFixedW(freq, spec, init, w1, w2)
     out.stds   = sqrt(diag(C));
     out.model  = @(w, p) abs(solFun(p(1), p(2), p(3), w, p(4)));
 end
-
-end  % <-- Required to close the script when using local functions
