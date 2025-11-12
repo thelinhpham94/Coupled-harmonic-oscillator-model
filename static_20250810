@@ -1,0 +1,129 @@
+%% multi_gap_fit_with_errorbars_and_export.m
+% Fits a driven coupled‐oscillator model to spectra across gap sizes
+% Sweeps w1 and w2 to minimize total uncertainty at large g
+% Extracts γ₁, γ₂, v and their 1σ errors, plots vs g, exports figures and data.
+
+clear; close all; clc;
+
+%% 1) Gap list and large-gap threshold
+gList = 0.02:0.02:0.26;
+largeG  = gList >= 0.20;
+nG      = numel(gList);
+
+%% 2) Parameter sweep ranges
+w1_vals = 29.5;
+w2_vals = 27:0.2:28;
+best_score = Inf;
+best_w1 = NaN; best_w2 = NaN;
+
+%% 3) Evaluate each (w1,w2) pair
+for w1 = w1_vals
+    for w2 = w2_vals
+        total_unc = 0;
+        for k = find(largeG)
+            g = gList(k);
+            fname = sprintf('g=%.2f.csv', g);
+            D = importdata(fullfile('P:/Matlab/Fano fitting/Simulations/New folder (2)/', fname));
+            freq = D(:,1); spec = D(:,2);
+            out = fitSpectrumWithFixedW(freq, spec, [135.5,5.8,0.77,34.4], w1, w2);
+            total_unc = total_unc + sum(out.stds(2:3));
+        end
+        if total_unc < best_score
+            best_score = total_unc;
+            best_w1 = w1; best_w2 = w2;
+        end
+    end
+end
+fprintf('Optimal w1=%.2f, w2=%.2f (score=%.3f)\n', best_w1, best_w2, best_score);
+
+%% 4) Fit all gaps using optimal w1,w2
+gamma1 = nan(1,nG); gamma2 = nan(1,nG); vval = nan(1,nG);
+g1_err = nan(1,nG); g2_err = nan(1,nG); v_err = nan(1,nG);
+init = [135.5,5.8,0.77,34.4];
+fitResults = cell(1,nG);
+
+for k = 1:nG
+    g = gList(k);
+    D = importdata(fullfile('P:/Matlab/Fano fitting/Simulations', sprintf('g=%.2f.csv',g)));
+    out = fitSpectrumWithFixedW(D(:,1), D(:,2), init, best_w1, best_w2);
+    p = out.params; s = out.stds;
+    gamma1(k)=p(2); g1_err(k)=s(2);
+    gamma2(k)=p(3); g2_err(k)=s(3);
+    vval(k)=p(4);   v_err(k)=s(4);
+    init = p;
+    fitResults{k} = struct('freq', D(:,1), 'spec', D(:,2), 'modelSpec', out.model(D(:,1), p), 'g', g);
+end
+
+%% 5) Export damping results
+outF = fullfile('P:/Matlab/Fano fitting/Simulations','results');
+if ~exist(outF,'dir'), mkdir(outF); end
+T = table(gList', gamma1', g1_err', gamma2', g2_err', ...
+    'VariableNames',{'g','gamma1','err1','gamma2','err2'});
+writetable(T, fullfile(outF,'damping_vs_gap_data.csv'));
+
+%% 6) Export coupling and plots
+T2 = table(gList', vval', v_err', 'VariableNames',{'g','v','v_err'});
+writetable(T2, fullfile(outF,'coupling_vs_gap_data.csv'));
+
+h1 = figure;
+hold on;
+errorbar(gList, gamma1, g1_err, 'o-', 'DisplayName', '\gamma_1');
+errorbar(gList, gamma2, g2_err, 's-', 'DisplayName', '\gamma_2');
+xlabel('Gap size g'); ylabel('\gamma'); legend; grid on;
+title('Damping vs Gap Size');
+saveas(h1, fullfile(outF,'damping_vs_gap.png'));
+
+h2 = figure;
+errorbar(gList, vval, v_err, 'd-', 'DisplayName', 'v');
+xlabel('Gap size g'); ylabel('Coupling v'); legend; grid on;
+title('Coupling vs Gap Size');
+saveas(h2, fullfile(outF,'coupling_vs_gap.png'));
+
+%% 7) Plot fitted vs original spectra
+for k = 1:nG
+    R = fitResults{k};
+    figure;
+    plot(R.freq, R.spec, 'b-', 'DisplayName', 'Original');
+    hold on;
+    plot(R.freq, R.modelSpec, 'r--', 'DisplayName', 'Fit');
+    xlabel('Frequency'); ylabel('Intensity');
+    title(sprintf('Fit vs Original Spectrum (g = %.2f)', R.g));
+    legend; grid on;
+    saveas(gcf, fullfile(outF, sprintf('fit_vs_original_g=%.2f.png', R.g)));
+    close;
+end
+
+%% helper: fit with fixed w1,w2
+function out = fitSpectrumWithFixedW(freq, spec, init, w1, w2)
+    persistent solFun w1_prev w2_prev
+    if isempty(solFun) || w1~=w1_prev || w2~=w2_prev
+        syms t x1(t) x2(t) g1 g2 v a1 omega x10 x20
+        x1 = x10*exp(1i*omega*t);
+        x2 = x20*exp(1i*omega*t);
+        eq1 = diff(x1,t,2) + w1^2*x1 + g1*diff(x1,t) - v*x2 == a1*exp(1i*omega*t);
+        eq2 = diff(x2,t,2) + w2^2*x2 + g2*diff(x2,t) - v*x1 == 0;
+        sol = solve([eq1,eq2],[x10,x20]);
+        solFun = matlabFunction(sol.x10,'Vars',[a1,g1,g2,omega,v]);
+        w1_prev = w1; w2_prev = w2;
+    end
+    model = @(p,w) abs(solFun(p(1),p(2),p(3),w,p(4)));
+    resid = @(p) model(p, freq) - spec;
+    try
+        opts = optimoptions('lsqnonlin','Display','off');
+        pFit = lsqnonlin(resid, init, zeros(1,4), [], opts);
+    catch
+        pFit = fminsearch(@(p) sum(resid(p).^2), init);
+    end
+    r = resid(pFit); n = numel(r); m = numel(pFit);
+    sigma = sqrt(sum(r.^2)/(n-m));
+    dp = max(abs(pFit),1e-3) * 1e-6 + 1e-8;
+    J = zeros(n,m);
+    for j = 1:m
+        d = zeros(1,m); d(j) = dp(j);
+        J(:,j) = (resid(pFit + d) - resid(pFit - d)) / (2*dp(j));
+    end
+    C = sigma^2 * pinv(J'*J + 1e-6*trace(J'*J)/m * eye(m));
+    out.params = pFit;
+    out.stds   = sqrt(diag(C));
+    out.model  = @(w, p) abs(solFun(p(1),p(2),p(3),w,p(4)));
+end
