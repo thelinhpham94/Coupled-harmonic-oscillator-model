@@ -1,0 +1,183 @@
+%% fit_time_list_sweep_w2.m
+% Sweeps w2 for each time in tList, fits spectrum with a 2-oscillator
+% bright–dark TCMT model (off-diagonal coupling is -v^2), saves and plots results.
+
+clear; close all; clc;
+
+%% 1) Settings
+g        = 0.08;
+tList    = [-11, 0.6, 1, 3, 5, 7, 10, 20, 50, 100];
+w1       = 28.05;                   % fixed bright-mode resonance
+w2_range = 26.5:0.1:28;             % sweep range for dark-mode resonance
+init     = [25.68, 6, 1, 44.3];  % [a1, gamma1, gamma2, v2]  (v2 = v^2)
+
+results = [];  % rows: [t, g1, sg1, g2, sg2, v2, sv2, v, sv, w1, w2best]
+
+%% 2) Output and data folders
+basePath = 'P:\Report and results\Manuscripts\FELIX_0124\FEL scan';
+outF  = fullfile(basePath, 'results');
+dataF = fullfile(basePath, 'Smoothed');
+if ~exist(outF, 'dir'), mkdir(outF); end
+
+%% 3) Loop over time delays
+for t = tList
+    fname    = sprintf('g=%.2f_%gps.txt', g, t);
+    filePath = fullfile(dataF, fname);
+
+    if ~isfile(filePath)
+        warning('File not found for t = %.1f ps', t);
+        continue;
+    end
+
+    D = importdata(filePath);
+    % Your convention: wavelength (um) -> frequency-like axis used for fitting
+    freq  = 300 ./ D(:,1);
+    Tmeas = D(:,2);          % measured transmission
+    specA = 1 - Tmeas;       % convert to absorption-like data for the fit
+
+    best_score = Inf;
+    best_w2    = NaN;
+    best_out   = [];
+
+    %% 4) Sweep w2 to find best fit (minimize σ(γ1)+σ(γ2))
+    for w2 = w2_range
+        try
+            out   = fitSpectrumWithFixedW(freq, specA, init, w1, w2);
+            score = sum(out.stds(2:3)); % uncertainty in γ1 and γ2
+            if score < best_score
+                best_score = score;
+                best_w2    = w2;
+                best_out   = out;
+            end
+        catch
+            continue; % skip failed fits
+        end
+    end
+
+    %% 5) Store results
+    if isempty(best_out)
+        warning('No valid fit for t = %.1f ps', t);
+        continue;
+    end
+
+    p = best_out.params;   % [a1, gamma1, gamma2, v2]
+    s = best_out.stds;
+
+    v2 = p(4);
+    v  = sqrt(max(v2, 0));
+    % Error propagation: sv ≈ s(v2)/(2*sqrt(v2))
+    sv = (s(4) / max(2*v, 1e-12));
+
+    results(end+1,:) = [t, p(2), s(2), p(3), s(3), v2, s(4), v, sv, w1, best_w2]; %#ok<AGROW>
+
+    %% 6) Plot fit (compare in transmission domain)
+    modelAbs = best_out.model(freq, p);   % absorption-like
+    fh = figure('Visible','off');
+    plot(300./freq, Tmeas, 'b-', 'LineWidth', 1.2, 'DisplayName', 'Original');
+    hold on;
+    plot(300./freq, 1 - modelAbs, 'r--', 'LineWidth', 1.2, 'DisplayName', 'Fit');
+    xlabel('Wavelength (\mum)'); ylabel('Transmittance');
+    title(sprintf('t = %.1f ps', t));
+    legend('Location','best');
+    exportgraphics(fh, fullfile(outF, sprintf('fit_g=%.2f_t=%.1fps_w2=%.2f.png', g, t, best_w2)));
+    close(fh);
+
+    % Save frequency + transmission data to CSV
+    data_table = table(freq(:), Tmeas(:), (1 - modelAbs(:)), ...
+        'VariableNames', {'Frequency', 'OriginalTransmission', 'FittedTransmission'});
+    writetable(data_table, fullfile(outF, sprintf('data_g=%.2f_t=%.1fps_w2=%.2f.csv', g, t, best_w2)));
+end
+
+%% 7) Save all results
+if ~isempty(results)
+    T = array2table(results, 'VariableNames', ...
+        {'t','gamma1','err_gamma1','gamma2','err_gamma2', ...
+         'v2','err_v2','v','err_v','w1','w2'});
+    writetable(T, fullfile(outF, 'fit_results_vs_time_PIT80.csv'));
+
+    %% 8) Plot γ₁, γ₂ vs time
+    fh1 = figure('Visible','off');
+    errorbar(T.t, T.gamma1, T.err_gamma1, 'o-', 'DisplayName', '\gamma_1');
+    hold on;
+    errorbar(T.t, T.gamma2, T.err_gamma2, 's-', 'DisplayName', '\gamma_2');
+    xlabel('Time (ps)'); ylabel('\gamma'); legend;
+    title('\gamma_1 and \gamma_2 vs Time');
+    exportgraphics(fh1, fullfile(outF, 'gamma_vs_time.png'));
+    close(fh1);
+
+    %% 9) Plot v (and optionally v^2) vs time
+    fh2 = figure('Visible','off');
+    errorbar(T.t, T.v, T.err_v, 'd-', 'DisplayName', 'v');
+    xlabel('Time (ps)'); ylabel('Coupling v'); legend;
+    title('Coupling v vs Time');
+    exportgraphics(fh2, fullfile(outF, 'v_vs_time.png'));
+    close(fh2);
+
+    fh3 = figure('Visible','off');
+    errorbar(T.t, T.v2, T.err_v2, '^-', 'DisplayName', 'v^2');
+    xlabel('Time (ps)'); ylabel('Coupling v^2'); legend;
+    title('Coupling v^2 vs Time');
+    exportgraphics(fh3, fullfile(outF, 'v2_vs_time.png'));
+    close(fh3);
+end
+
+%% ======================================================================
+%% Helper: fit with fixed w1, w2  (fast, no Symbolic Math)
+function out = fitSpectrumWithFixedW(w, specA, init, w1, w2)
+% Fits absorption-like spectrum specA(w) with parameters:
+%   p = [a1, gamma1, gamma2, v2]  where v2 = v^2 (off-diagonal = -v^2)
+%
+% Returns: out.params, out.stds, out.model(w,p)
+
+    model = @(p, ww) model_absorption(ww, p, w1, w2);
+    resid = @(p) model(p, w) - specA;
+
+    % Fit (bounded, nonnegative params)
+    try
+        opts = optimoptions('lsqnonlin', 'Display','off', ...
+                            'MaxIterations',400, 'FunctionTolerance',1e-10);
+        lb   = [0, 0, 0, 0];
+        ub   = [Inf, Inf, Inf, Inf];
+        pFit = lsqnonlin(resid, init, lb, ub, opts);
+    catch ME
+        warning('lsqnonlin failed (%s). Falling back to fminsearch.', ME.message);
+        pFit = fminsearch(@(p) sum(resid(p).^2), init, ...
+                          optimset('Display','off','MaxIter',1e4));
+    end
+
+    % Uncertainties via numerical Jacobian
+    r     = resid(pFit);  n = numel(r);  m = numel(pFit);
+    sigma = sqrt(sum(r.^2) / max(n - m, 1));
+    dp    = max(abs(pFit), 1e-6) * 1e-6 + 1e-9;
+    J     = zeros(n, m);
+    for j = 1:m
+        e = zeros(1,m); e(j) = dp(j);
+        J(:,j) = (resid(pFit + e) - resid(pFit - e)) / (2*dp(j));
+    end
+    JTJ = J.'*J;
+    C   = sigma^2 * pinv(JTJ + 1e-9 * trace(JTJ)/m * eye(m));
+
+    out.params = pFit(:).';
+    out.stds   = sqrt(max(0, diag(C))).';
+    out.model  = @(ww, pp) model(pp, ww);
+end
+
+function A = model_absorption(omega, p, w1, w2)
+% Absorption-like lineshape from the bright–dark TCMT model.
+% Matrix:
+%   [chi1   -v2] [x1] = [a1]
+%   [-v2   chi2] [x2]   [ 0]
+% with chi_k = w_k^2 - omega^2 - i*gamma_k*omega  and v2 = v^2.
+% We use A(ω) ~ |x1|^2 and compare transmission as 1 - A.
+
+    a1 = p(1);  g1 = p(2);  g2 = p(3);  v2 = p(4);
+    omega = omega(:).'; % row for broadcasting
+
+    chi1 = (w1.^2 - omega.^2) - 1i*g1/2.5.*omega;
+    chi2 = (w2.^2 - omega.^2) - 1i*g2.*omega;
+
+    detA = chi1 .* chi2 - (v2.^2);  % note: (v^2)^2 in the determinant
+    x1   = a1 .* chi2 ./ detA;
+    A    = abs(x1).^2;              % proportional to absorption
+    A    = A(:);                    % column vector
+end
